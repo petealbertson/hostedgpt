@@ -241,4 +241,10 @@ class MessagesControllerTest < ActionDispatch::IntegrationTest
       end
     end
   end
+
+  test "the sidebar keeps its width while navigating between assistants" do
+    get conversation_messages_url(@conversation, version: 1)
+
+    assert_select "nav.flex-shrink-0"
+  end
 end
