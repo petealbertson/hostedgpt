@@ -1,0 +1,174 @@
+# Fabrica v3 — fabrica-coordinate.yml
+# The coordinator model. One headless agent (prompts/coordinator.md) orchestrates
+# the whole issue end to end using pi-subagents: per milestone it runs a fresh
+# worker, then parallel fresh reviewers, then a fix worker, looping until clean.
+# Everything is tracked in GitHub (PR description checklist + comments + commits),
+# which is also the crash-resume state.
+#
+# Triggers:
+#   - issues.assigned to fabrica-agent  (the normal entry point)
+#   - workflow_dispatch (issue=)         (used by fabrica-watch.yml to retry after failure)
+# Both are read from the default branch (main).
+name: Fabrica Coordinate
+
+run-name: "Coordinate #${{ github.event.issue.number || github.event.inputs.issue }}"
+
+on:
+  issues:
+    types: [assigned]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Issue number to coordinate"
+        required: true
+
+concurrency:
+  group: factory-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  coordinate:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'issues' && github.event.assignee.login == 'fabrica-agent')
+    runs-on: [self-hosted, linux, X64, factory, '${{ github.repository }}']
+    timeout-minutes: 720
+    env:
+      FACTORY_REPO: ${{ github.repository }}
+      FACTORY_ISSUE: ${{ github.event.issue.number || github.event.inputs.issue }}
+      FACTORY_RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Pull latest factory-config (coordinator prompt + models)
+        run: |
+          set -uo pipefail
+          cd ~/factory
+          git fetch origin main && git merge --ff-only origin/main \
+            || echo "::warning::could not update ~/factory; using current HEAD"
+
+      - name: Reconcile VM to factory-config (update pi, bake models)
+        run: ~/factory/templates/scripts/factory-reconcile
+
+      - name: Announce how to tail this run's pi session
+        run: |
+          FACTORY_RUNNER="$(hostname)"
+          cat <<EOF
+          ::notice::This run's pi session lives on runner '$FACTORY_RUNNER'.
+          Live tail (run from your machine):
+            ssh $FACTORY_RUNNER 'f=\$(grep -rsl "Fabrica Run #$FACTORY_RUN_ID" ~/.pi/agent/sessions/ 2>/dev/null | head -1); [ -n "\$f" ] && tail -n 50 -f "\$f"'
+          HTML audit (after the run):
+            ssh $FACTORY_RUNNER 'f=\$(grep -rsl "Fabrica Run #$FACTORY_RUN_ID" ~/.pi/agent/sessions/ 2>/dev/null | head -1); pi --export "\$f" /tmp/run-$FACTORY_RUN_ID.html' && scp $FACTORY_RUNNER:/tmp/run-$FACTORY_RUN_ID.html .
+          Actions log: https://github.com/$FACTORY_REPO/actions/runs/$FACTORY_RUN_ID
+          EOF
+
+      - name: Run the coordinator
+        run: |
+          set -uo pipefail
+          # shellcheck disable=SC1091
+          source ~/factory/models.env
+          [ -n "${COORDINATOR_MODELS:-}" ] || { echo "::error::COORDINATOR_MODELS not set in ~/factory/models.env"; exit 1; }
+
+          # Ensure a gh-authed checkout exists and is on latest main. The
+          # coordinator does git work (branch/commit/push) here; gh's credential
+          # helper makes pushes authenticate as the runner's gh user.
+          REPO_DIR="$HOME/projects/$(basename "$FACTORY_REPO")"
+          if [ ! -d "$REPO_DIR/.git" ]; then
+            mkdir -p "$HOME/projects"
+            gh repo clone "$FACTORY_REPO" "$REPO_DIR"
+          fi
+          cd "$REPO_DIR"
+
+          # Crash-proof checkout reset. A previous run killed mid-edit (e.g. by
+          # a transient provider 500) can leave the tree dirty or on a feature
+          # branch, which would make a naive `git checkout main` fail and block
+          # ALL reruns. Stash anything uncommitted (so work is recoverable), then
+          # force back to a clean main. Never throws.
+          git fetch origin main
+          git stash push -u -m "auto: uncommitted changes before coordinate run $FACTORY_RUN_ID ($(date -u +%FT%TZ))" 2>/dev/null || true
+          git checkout -f main 2>/dev/null || git checkout -f -B main origin/main
+          git reset --hard origin/main
+          git clean -fd
+          # Commits authored as the repo owner (petealbertson); pushes authenticate
+          # as the runner's gh user. The ready-for-review ping below is posted by a
+          # different identity (fabrica-agent / github-actions[bot]) so it notifies.
+          git config user.email "5597250+petealbertson@users.noreply.github.com"
+          git config user.name "Peter Albertson"
+
+          CONTEXT="[Fabrica Run #$FACTORY_RUN_ID | coordinate | $FACTORY_REPO#$FACTORY_ISSUE]
+
+          Coordinate GitHub issue #$FACTORY_ISSUE in $FACTORY_REPO now. Begin by reading it with: gh issue view $FACTORY_ISSUE -R $FACTORY_REPO"
+          PROMPT="$(cat ~/factory/prompts/coordinator.md)
+
+          ---
+
+          $CONTEXT"
+
+          # Retry the coordinator on transient crashes, rotating the model
+          # provider each attempt. The umans provider has no internal retry and
+          # throws on any HTTP 5xx; retrying into the same dead provider is what
+          # once exhausted all attempts during a umans outage. COORDINATOR_MODELS
+          # (from models.env) is a space-separated ordered list — attempt N uses
+          # element N. This is the ONLY fallback the coordinator itself has
+          # (subagents get their own via settings.json fallbackModels).
+          #
+          # Re-running from the top is safe: the coordinator commits
+          # incrementally and re-derives state from GitHub (issue/PR/checklist),
+          # so it resumes from the last committed milestone. Nonzero exit is
+          # almost always a crash (provider/OOM), never a logic failure (those
+          # are handled in-band via PR comments).
+          pick_model() {  # $1 = 1-based index into the space-separated list
+            echo "$COORDINATOR_MODELS" | awk -v n="$1" '{print $n}'
+          }
+          MAX_ATTEMPTS="${FACTORY_COORDINATOR_MAX_ATTEMPTS:-3}"
+          PRIMARY_MODEL="$(pick_model 1)"
+          attempt=1
+          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+            MODEL="$(pick_model "$attempt")"
+            [ -n "$MODEL" ] || MODEL="$PRIMARY_MODEL"
+            echo "::notice::Coordinator attempt $attempt/$MAX_ATTEMPTS on model: $MODEL"
+            pi --name "fabrica/$FACTORY_REPO#$FACTORY_ISSUE run-$FACTORY_RUN_ID" \
+               --model "$MODEL" \
+               -p "$PROMPT" && break
+            rc=$?
+            if [ "$attempt" -eq "$MAX_ATTEMPTS" ]; then
+              echo "::error::Coordinator exited $rc after $MAX_ATTEMPTS attempts; giving up."
+              exit "$rc"
+            fi
+            backoff=$(( attempt * 30 ))
+            NEXT_MODEL="$(pick_model $(( attempt + 1 )))"
+            if [ -n "$NEXT_MODEL" ] && [ "$NEXT_MODEL" != "$MODEL" ]; then
+              echo "::warning::Coordinator crashed (exit $rc) on attempt $attempt ($MODEL); rotating provider, retrying in ${backoff}s with $NEXT_MODEL."
+            else
+              echo "::warning::Coordinator crashed (exit $rc) on attempt $attempt ($MODEL); retrying in ${backoff}s."
+            fi
+            # Reset the tree again before retrying (a mid-crash run may have left edits).
+            git stash push -u -m "auto: pre-retry stash, run $FACTORY_RUN_ID attempt $attempt" 2>/dev/null || true
+            git checkout -f main 2>/dev/null || true
+            git reset --hard origin/main
+            git clean -fd
+            sleep "$backoff"
+            attempt=$(( attempt + 1 ))
+          done
+
+      - name: Notify ready for review (@petealbertson)
+        if: success()
+        continue-on-error: true   # a notify failure must never fail a successful coordinate run
+        env:
+          FACTORY_REPO: ${{ env.FACTORY_REPO }}
+          FACTORY_ISSUE: ${{ env.FACTORY_ISSUE }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # fallback only (github-actions[bot])
+        run: |
+          set -uo pipefail
+          PR="$(gh pr list -R "$FACTORY_REPO" --state open --head "fabrica/$FACTORY_ISSUE" --json number --jq '.[0].number' 2>/dev/null)"
+          [ -n "$PR" ] || { echo "no open PR for fabrica/$FACTORY_ISSUE; skipping notify"; exit 0; }
+          BODY="@petealbertson ✅ PR #$PR is ready for your review — implemented and reviewed by the factory. (The factory never merges; the one PR is yours to merge.)"
+          # Post as fabrica-agent if its gh account is on this VM (guaranteed @mention
+          # ping); else GITHUB_TOKEN (github-actions[bot]). petealbertson stays the
+          # default account for all other work (commits + review/fix comments).
+          # Non-fatal: if neither token can post, warn and move on (the coordinator
+          # already updated the PR checklist, so the human is unblocked regardless).
+          NOTIFY_TOKEN="$(env -u GH_TOKEN gh auth token --user fabrica-agent 2>/dev/null || true)"
+          TOKEN="${NOTIFY_TOKEN:-$GH_TOKEN}"
+          if GH_TOKEN="$TOKEN" gh pr comment "$PR" -R "$FACTORY_REPO" --body "$BODY" 2>/dev/null; then
+            echo "notify: posted as $([ -n "$NOTIFY_TOKEN" ] && echo fabrica-agent || echo github-actions[bot])"
+          else
+            echo "::warning::notify comment failed (fabrica-agent token may lack repo access); the PR is still ready for review"
+          fi

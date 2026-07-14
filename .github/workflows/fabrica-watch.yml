@@ -1,0 +1,64 @@
+# Fabrica v3 — fabrica-watch.yml
+# Watches the Fabrica Coordinate workflow. When a coordinator run fails or times
+# out, posts the failure reason (log tail) as a comment on the original issue and
+# retries the coordinator (capped at 3 retries). This is the only self-recovery
+# mechanism — no sweeper/cron. Read from the default branch (main).
+name: Fabrica Watch
+
+on:
+  workflow_run:
+    workflows: ["Fabrica Coordinate"]
+    types: [completed]
+
+concurrency:
+  group: factory-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    if: github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'timed_out'
+    runs-on: [self-hosted, linux, X64, factory, '${{ github.repository }}']
+    timeout-minutes: 5
+    env:
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      RUN_NAME: ${{ github.event.workflow_run.name }}
+      CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+    steps:
+      - name: Comment failure reason and retry
+        run: |
+          set -uo pipefail
+          # The coordinator run-name is "Coordinate #<issue>"; recover the issue.
+          ISSUE="$(printf '%s' "$RUN_NAME" | grep -oE '#[0-9]+' | head -1 | tr -d '#')"
+          if [ -z "$ISSUE" ]; then
+            echo "::warning::could not parse issue number from run name '$RUN_NAME'; not retrying"
+            exit 0
+          fi
+
+          # Retry cap: count prior retry comments on the issue.
+          ATTEMPTS="$(gh issue view "$ISSUE" -R "$REPO" --json comments \
+            --jq '[.comments[] | select(.body | test("Fabrica retry"))] | length' 2>/dev/null || echo 0)"
+
+          FAILED_URL="https://github.com/$REPO/actions/runs/$RUN_ID"
+
+          if [ "$ATTEMPTS" -ge 3 ]; then
+            gh issue comment "$ISSUE" -R "$REPO" --body "Coordinator run failed again (conclusion: $CONCLUSION) after $ATTEMPTS retries. Giving up — this needs a human. [Failed run]($FAILED_URL)" || true
+            exit 0
+          fi
+
+          # Failure reason = tail of the failed step log.
+          LOG="$(gh run view "$RUN_ID" -R "$REPO" --log-failed 2>/dev/null | tail -40 || echo '(failed-step log unavailable)')"
+
+          NEXT=$((ATTEMPTS + 1))
+          gh issue comment "$ISSUE" -R "$REPO" --body "Fabrica retry attempt $NEXT: the coordinator run failed (conclusion: $CONCLUSION). Restarting it; it will resume from wherever GitHub state was left. [Failed run]($FAILED_URL)
+
+          <details><summary>Last log lines</summary>
+
+          \`\`\`
+          $LOG
+          \`\`\`
+          </details>" || true
+
+          # Retry: dispatch the coordinator (workflow_dispatch -> re-entrant).
+          gh workflow run fabrica-coordinate.yml -R "$REPO" -f issue="$ISSUE" \
+            || echo "::warning::could not dispatch retry; re-assign the issue to fabrica-agent to restart manually"

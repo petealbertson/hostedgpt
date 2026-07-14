@@ -1,0 +1,193 @@
+# Fabrica v3 — fabrica-review.yml
+#
+# Hand off an EXISTING pull request to the factory for review (and optional
+# fixes). Unlike fabrica-coordinate.yml (issue → branch → PR), this triggers
+# from a PR comment and runs the coordinator's parallel-review fan-out against a
+# PR that already exists — e.g. one you opened locally.
+#
+# Commands (comment on the PR; repo write+ collaborators only):
+#   /fabrica review      → read-only assessment, post findings, stop (no edits)
+#   /fabrica fix         → review, then apply fixes + push to the PR branch
+#   /fabrica review+fix  → alias for `fix`
+#   /fabrica             → defaults to `review`
+# (@fabrica-agent … is accepted as a trigger token too.)
+#
+# Shares the factory-<repo> concurrency group with fabrica-coordinate.yml, so a
+# review handoff never overlaps a coordinate run on the same single VM checkout.
+#
+# Base prompt (Rails). For iOS repos, install fabrica-review-ios.yml instead —
+# it adds the `ios` runner label + the iOS platform overlay (fix mode builds via
+# xc-remote-build on the Mac). Do NOT install both for one repo.
+name: Fabrica Review
+
+run-name: "Review #${{ github.event.issue.number }} (${{ github.event.comment.user.login }})"
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: factory-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  authorize:
+    if: ${{ github.event.issue.pull_request != null && (contains(github.event.comment.body, '/fabrica') || contains(github.event.comment.body, '@fabrica-agent')) && github.event.comment.user.login != 'github-actions[bot]' && github.event.comment.user.login != 'fabrica-agent' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      ok: ${{ steps.check.outputs.ok }}
+      mode: ${{ steps.check.outputs.mode }}
+      pr: ${{ steps.check.outputs.pr }}
+    steps:
+      - id: check
+        env:
+          BODY: ${{ github.event.comment.body }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR="${{ github.event.issue.number }}"
+          # Permission gate: only write+ collaborators may trigger.
+          PERM="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$COMMENTER/permission" --jq .permission 2>/dev/null || echo none)"
+          case "$PERM" in admin|maintain|write) OK=true ;; *) OK=false ;; esac
+          # Mode: 'fix' anywhere in the command => fix; otherwise review.
+          if printf '%s' "$BODY" | grep -qiE '\bfix\b'; then MODE=fix; else MODE=review; fi
+          echo "ok=$OK"     >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "pr=$PR"     >> "$GITHUB_OUTPUT"
+          echo "::notice::$COMMENTER permission=$PERM → mode=$MODE on PR #$PR (authorized=$OK)"
+
+  review:
+    needs: authorize
+    if: ${{ needs.authorize.outputs.ok == 'true' }}
+    runs-on: [self-hosted, linux, X64, factory, '${{ github.repository }}']
+    timeout-minutes: 240
+    env:
+      FACTORY_REPO: ${{ github.repository }}
+      FACTORY_PR: ${{ needs.authorize.outputs.pr }}
+      FACTORY_MODE: ${{ needs.authorize.outputs.mode }}
+      FACTORY_RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: React to the command (ack)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes -X POST >/dev/null 2>&1 || true
+
+      - name: Pull latest factory-config (reviewer prompt + models)
+        run: |
+          set -uo pipefail
+          cd ~/factory
+          git fetch origin main && git merge --ff-only origin/main \
+            || echo "::warning::could not update ~/factory; using current HEAD"
+
+      - name: Reconcile VM to factory-config (update pi, bake models)
+        run: ~/factory/templates/scripts/factory-reconcile
+
+      - name: Announce how to tail this run's pi session
+        run: |
+          FACTORY_RUNNER="$(hostname)"
+          cat <<EOF
+          ::notice::This run's pi session lives on runner '$FACTORY_RUNNER'.
+          Live tail (run from your machine):
+            ssh $FACTORY_RUNNER 'f=\$(grep -rsl "Fabrica Run #$FACTORY_RUN_ID" ~/.pi/agent/sessions/ 2>/dev/null | head -1); [ -n "\$f" ] && tail -n 50 -f "\$f"'
+          Actions log: https://github.com/$FACTORY_REPO/actions/runs/$FACTORY_RUN_ID
+          EOF
+
+      - name: Run the reviewer
+        run: |
+          set -uo pipefail
+          # shellcheck disable=SC1091
+          source ~/factory/models.env
+          [ -n "${COORDINATOR_MODELS:-}" ] || { echo "::error::COORDINATOR_MODELS not set in ~/factory/models.env"; exit 1; }
+
+          # Ensure a gh-authed checkout exists.
+          REPO_DIR="$HOME/projects/$(basename "$FACTORY_REPO")"
+          if [ ! -d "$REPO_DIR/.git" ]; then
+            mkdir -p "$HOME/projects"
+            gh repo clone "$FACTORY_REPO" "$REPO_DIR"
+          fi
+          cd "$REPO_DIR"
+
+          # Check out the PR's HEAD branch (we review THIS PR, not main).
+          # Same-repo PRs only — fix mode can't push to a fork anyway.
+          git fetch origin
+          git stash push -u -m "auto: uncommitted changes before review run $FACTORY_RUN_ID ($(date -u +%FT%TZ))" 2>/dev/null || true
+          HEAD_BRANCH="$(gh pr view "$FACTORY_PR" -R "$FACTORY_REPO" --json headRefName --jq .headRefName)"
+          git fetch origin "$HEAD_BRANCH" 2>/dev/null || true
+          git checkout -f "$HEAD_BRANCH" 2>/dev/null || git checkout -f -B "$HEAD_BRANCH" "origin/$HEAD_BRANCH"
+          git reset --hard "origin/$HEAD_BRANCH"
+          git clean -fd
+          # Commits authored as the repo owner (petealbertson); pushes authenticate
+          # as the runner's gh user. The ready-for-review ping below is posted by a
+          # different identity (fabrica-agent / github-actions[bot]) so it notifies.
+          git config user.email "5597250+petealbertson@users.noreply.github.com"
+          git config user.name "Peter Albertson"
+
+          CONTEXT="[Fabrica Run #$FACTORY_RUN_ID | review ($FACTORY_MODE) | $FACTORY_REPO#$FACTORY_PR]
+
+          Review PR #$FACTORY_PR in $FACTORY_REPO now (mode: $FACTORY_MODE). Begin by reading it with: gh pr view $FACTORY_PR -R $FACTORY_REPO"
+
+          PROMPT="$(cat ~/factory/prompts/review.md)
+
+          ---
+
+          $CONTEXT"
+
+          # Retry on transient crashes, rotating the model provider each attempt
+          # (same as the coordinator). Nonzero exit is almost always a crash
+          # (provider/OOM); re-running re-derives state from GitHub and resumes.
+          pick_model() {  # $1 = 1-based index into the space-separated list
+            echo "$COORDINATOR_MODELS" | awk -v n="$1" '{print $n}'
+          }
+          MAX_ATTEMPTS="${FACTORY_MAX_ATTEMPTS:-3}"
+          PRIMARY_MODEL="$(pick_model 1)"
+          attempt=1
+          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+            MODEL="$(pick_model "$attempt")"
+            [ -n "$MODEL" ] || MODEL="$PRIMARY_MODEL"
+            echo "::notice::Reviewer attempt $attempt/$MAX_ATTEMPTS on model: $MODEL"
+            pi --name "fabrica/$FACTORY_REPO#$FACTORY_PR review-$FACTORY_RUN_ID" \
+               --model "$MODEL" \
+               -p "$PROMPT" && break
+            rc=$?
+            if [ "$attempt" -eq "$MAX_ATTEMPTS" ]; then
+              echo "::error::Reviewer exited $rc after $MAX_ATTEMPTS attempts; giving up."
+              exit "$rc"
+            fi
+            backoff=$(( attempt * 30 ))
+            echo "::warning::Reviewer crashed (exit $rc) on attempt $attempt ($MODEL); retrying in ${backoff}s."
+            # Reset the tree to the PR branch again before retrying.
+            git stash push -u -m "auto: pre-retry stash, run $FACTORY_RUN_ID attempt $attempt" 2>/dev/null || true
+            git checkout -f "$HEAD_BRANCH" 2>/dev/null || true
+            git reset --hard "origin/$HEAD_BRANCH"
+            git clean -fd
+            sleep "$backoff"
+            attempt=$(( attempt + 1 ))
+          done
+
+      - name: Notify review/fix complete (@petealbertson)
+        if: success()
+        continue-on-error: true   # a notify failure must never fail a successful review/fix run
+        env:
+          FACTORY_REPO: ${{ env.FACTORY_REPO }}
+          FACTORY_PR: ${{ env.FACTORY_PR }}
+          FACTORY_MODE: ${{ env.FACTORY_MODE }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # fallback only (github-actions[bot])
+        run: |
+          set -uo pipefail
+          BODY="@petealbertson ✅ Factory ${FACTORY_MODE} complete on PR #$FACTORY_PR. (The factory never merges; the one PR is yours to merge.)"
+          # Post as fabrica-agent if its gh account is on this VM (guaranteed @mention
+          # ping); else GITHUB_TOKEN (github-actions[bot]). petealbertson stays the
+          # default account for all other work (commits + review/fix comments).
+          # Non-fatal: if neither token can post, warn and move on.
+          NOTIFY_TOKEN="$(env -u GH_TOKEN gh auth token --user fabrica-agent 2>/dev/null || true)"
+          TOKEN="${NOTIFY_TOKEN:-$GH_TOKEN}"
+          if GH_TOKEN="$TOKEN" gh pr comment "$FACTORY_PR" -R "$FACTORY_REPO" --body "$BODY" 2>/dev/null; then
+            echo "notify: posted as $([ -n "$NOTIFY_TOKEN" ] && echo fabrica-agent || echo github-actions[bot])"
+          else
+            echo "::warning::notify comment failed (fabrica-agent token may lack repo access); the PR is still ready for review"
+          fi
