@@ -111,6 +111,10 @@ jobs:
             gh repo clone "$FACTORY_REPO" "$REPO_DIR"
           fi
           cd "$REPO_DIR"
+          # Fork safety: pin gh's default repo to our fork (not the upstream parent).
+          # A bare 'gh pr create' on a fork otherwise targets upstream. Defense-in-depth
+          # alongside the coordinator's mandatory -R $FACTORY_REPO.
+          gh repo set-default "$FACTORY_REPO"
 
           # Check out the PR's HEAD branch (we review THIS PR, not main).
           # Same-repo PRs only — fix mode can't push to a fork anyway.

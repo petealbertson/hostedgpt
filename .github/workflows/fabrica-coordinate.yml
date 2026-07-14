@@ -75,6 +75,10 @@ jobs:
             gh repo clone "$FACTORY_REPO" "$REPO_DIR"
           fi
           cd "$REPO_DIR"
+          # Fork safety: pin gh's default repo to our fork (not the upstream parent).
+          # A bare 'gh pr create' on a fork otherwise targets upstream. Defense-in-depth
+          # alongside the coordinator's mandatory -R $FACTORY_REPO.
+          gh repo set-default "$FACTORY_REPO"
 
           # Crash-proof checkout reset. A previous run killed mid-edit (e.g. by
           # a transient provider 500) can leave the tree dirty or on a feature
