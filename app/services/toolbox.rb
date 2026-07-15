@@ -5,6 +5,7 @@ class Toolbox < SDK
     test_env = Rails.env.test? || nil
     [
       test_env && Toolbox::HelloWorld,
+      Setting.brave_search_api_key.present? && Toolbox::BraveSearch,
       Toolbox::OpenMeteo,
       Toolbox::Image,
       Toolbox::Memory,
