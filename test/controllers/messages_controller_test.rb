@@ -224,10 +224,10 @@ class MessagesControllerTest < ActionDispatch::IntegrationTest
     assert_contains_text "main", "Where were you born"
   end
 
-  test "the nav sidebar carries flex-shrink-0 to prevent width collapse during morph" do
+  test "the nav sidebar is marked turbo-permanent to avoid re-render during morph" do
     get conversation_messages_url(@conversation, version: 1)
     assert_response :success
-    assert_select "nav.flex-shrink-0"
+    assert_select "nav[data-turbo-permanent]"
   end
 
   test "when there are many assistants only a few are shown in the nav bar" do
