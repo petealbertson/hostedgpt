@@ -3,6 +3,7 @@ require "test_helper"
 class Toolbox::BraveSearchTest < ActiveSupport::TestCase
   setup do
     @brave_search = Toolbox::BraveSearch.new
+    WebMock.enable! # defend against WebMock state leaked by other toolbox tests (e.g. open_meteo_test calls WebMock.disable!)
   end
 
   test "brave_search parses and returns results" do
