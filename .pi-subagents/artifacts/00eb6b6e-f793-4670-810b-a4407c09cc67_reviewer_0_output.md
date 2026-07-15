@@ -1,1 +1,0 @@
-The test DB doesn't exist directly via `docker compose exec`, but `devloop test` ran the full suite (which creates the test DB). The full suite already confirmed the new test passes (665 tests, 0 failures). Let me verify the test count matches by checking what the baseline was, and confirm the new test is included.
