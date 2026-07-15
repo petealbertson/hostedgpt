@@ -10,7 +10,10 @@
 #   /fabrica fix         → review, then apply fixes + push to the PR branch
 #   /fabrica review+fix  → alias for `fix`
 #   /fabrica             → defaults to `review`
-# (@fabrica-agent … is accepted as a trigger token too.)
+#
+# For free-form follow-up feedback (e.g. "@fabrica-agent adjust the footer
+# padding"), use fabrica-followup.yml instead — it resumes the original
+# coordinator session and passes your comment as a follow-up prompt.
 #
 # Shares the factory-<repo> concurrency group with fabrica-coordinate.yml, so a
 # review handoff never overlaps a coordinate run on the same single VM checkout.
@@ -33,7 +36,7 @@ concurrency:
 
 jobs:
   authorize:
-    if: ${{ github.event.issue.pull_request != null && (contains(github.event.comment.body, '/fabrica') || contains(github.event.comment.body, '@fabrica-agent')) && github.event.comment.user.login != 'github-actions[bot]' && github.event.comment.user.login != 'fabrica-agent' }}
+    if: ${{ github.event.issue.pull_request != null && contains(github.event.comment.body, '/fabrica') && github.event.comment.user.login != 'github-actions[bot]' && github.event.comment.user.login != 'fabrica-agent' }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:

@@ -128,7 +128,8 @@ jobs:
             MODEL="$(pick_model "$attempt")"
             [ -n "$MODEL" ] || MODEL="$PRIMARY_MODEL"
             echo "::notice::Coordinator attempt $attempt/$MAX_ATTEMPTS on model: $MODEL"
-            pi --name "fabrica/$FACTORY_REPO#$FACTORY_ISSUE run-$FACTORY_RUN_ID" \
+            pi --session-id "fabrica-$FACTORY_ISSUE" \
+               --name "fabrica/$FACTORY_REPO#$FACTORY_ISSUE run-$FACTORY_RUN_ID" \
                --model "$MODEL" \
                -p "$PROMPT" && break
             rc=$?

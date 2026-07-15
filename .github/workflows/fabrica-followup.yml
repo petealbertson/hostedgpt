@@ -1,0 +1,237 @@
+# Fabrica v3 — fabrica-followup.yml
+#
+# Free-form follow-up on a factory PR. Comment `@fabrica-agent <feedback>` on any
+# PR and the coordinator resumes its original session (the one that implemented
+# the PR) with your feedback as a follow-up prompt. The coordinator addresses
+# the feedback, runs a review round, pushes, and stops.
+#
+# This complements fabrica-review.yml (which runs the parallel-review fan-out):
+#   /fabrica review|fix   → structured review/fix fan-out (fabrica-review.yml)
+#   @fabrica-agent <text>  → follow-up: address the feedback (THIS workflow)
+#
+# How it works:
+#   - The coordinate workflow creates a session with --session-id "fabrica-<issue>".
+#   - This workflow resumes that same session (--session-id "fabrica-<issue>"),
+#     so the coordinator has full context of the original implementation.
+#   - If the PR was opened manually (no coordinate session), it falls back to
+#     --session-id "fabrica-pr-<PR>" (fresh session, deterministic for future
+#     follow-ups on the same PR).
+#
+# Single file for both Rails and iOS — runner labels [self-hosted, factory, <repo>]
+# match both (iOS VMs also have `factory` + repo labels). The original session
+# already has the iOS platform overlay if applicable, so no overlay is needed here.
+#
+# Shares the factory-<repo> concurrency group with coordinate/review, so a
+# follow-up never overlaps another factory run on the same single VM checkout.
+name: Fabrica Follow-up
+
+run-name: "Follow-up #${{ github.event.issue.number }} (${{ github.event.comment.user.login }})"
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: factory-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  authorize:
+    if: ${{ github.event.issue.pull_request != null && contains(github.event.comment.body, '@fabrica-agent') && !contains(github.event.comment.body, '/fabrica') && github.event.comment.user.login != 'github-actions[bot]' && github.event.comment.user.login != 'fabrica-agent' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      ok: ${{ steps.check.outputs.ok }}
+      pr: ${{ steps.check.outputs.pr }}
+      feedback: ${{ steps.check.outputs.feedback }}
+      session_id: ${{ steps.check.outputs.session_id }}
+      issue: ${{ steps.check.outputs.issue }}
+    steps:
+      - id: check
+        env:
+          BODY: ${{ github.event.comment.body }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR="${{ github.event.issue.number }}"
+
+          # Permission gate: only write+ collaborators may trigger.
+          PERM="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$COMMENTER/permission" --jq .permission 2>/dev/null || echo none)"
+          case "$PERM" in admin|maintain|write) OK=true ;; *) OK=false ;; esac
+
+          # Extract feedback: everything after the @fabrica-agent mention.
+          FEEDBACK="$(printf '%s' "$BODY" | sed 's/@fabrica-agent[[:space:]]*//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')"
+
+          # Determine session-id: try to find the issue number from the PR's branch.
+          # The coordinate workflow names branches fabrica/<issue> and uses
+          # --session-id "fabrica-<issue>". If we can match that, we resume the
+          # original session. Otherwise, fall back to a PR-based session-id.
+          HEAD_BRANCH="$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json headRefName --jq .headRefName 2>/dev/null || echo "")"
+          ISSUE=""
+          SESSION_ID=""
+          if echo "$HEAD_BRANCH" | grep -qE '^fabrica/[0-9]+$'; then
+            ISSUE="$(echo "$HEAD_BRANCH" | sed 's|fabrica/||')"
+            SESSION_ID="fabrica-$ISSUE"
+          else
+            SESSION_ID="fabrica-pr-$PR"
+          fi
+
+          echo "ok=$OK"           >> "$GITHUB_OUTPUT"
+          echo "pr=$PR"           >> "$GITHUB_OUTPUT"
+          echo "feedback=$FEEDBACK" >> "$GITHUB_OUTPUT"
+          echo "session_id=$SESSION_ID" >> "$GITHUB_OUTPUT"
+          echo "issue=$ISSUE"     >> "$GITHUB_OUTPUT"
+          echo "::notice::$COMMENTER permission=$PERM → follow-up on PR #$PR (session=$SESSION_ID, authorized=$OK)"
+
+  followup:
+    needs: authorize
+    if: ${{ needs.authorize.outputs.ok == 'true' && needs.authorize.outputs.feedback != '' }}
+    runs-on: [self-hosted, factory, '${{ github.repository }}']
+    timeout-minutes: 720
+    env:
+      FACTORY_REPO: ${{ github.repository }}
+      FACTORY_PR: ${{ needs.authorize.outputs.pr }}
+      FACTORY_FEEDBACK: ${{ needs.authorize.outputs.feedback }}
+      FACTORY_SESSION_ID: ${{ needs.authorize.outputs.session_id }}
+      FACTORY_ISSUE: ${{ needs.authorize.outputs.issue }}
+      FACTORY_RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: React to the command (ack)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes -X POST >/dev/null 2>&1 || true
+
+      - name: Pull latest factory-config (coordinator prompt + models)
+        run: |
+          set -uo pipefail
+          cd ~/factory
+          git fetch origin main && git merge --ff-only origin/main \
+            || echo "::warning::could not update ~/factory; using current HEAD"
+
+      - name: Reconcile VM to factory-config (update pi, bake models)
+        run: ~/factory/templates/scripts/factory-reconcile
+
+      - name: Announce how to tail this run's pi session
+        run: |
+          FACTORY_RUNNER="$(hostname)"
+          cat <<EOF
+          ::notice::This run's pi session lives on runner '$FACTORY_RUNNER'.
+          Live tail (run from your machine):
+            ssh $FACTORY_RUNNER 'f=\$(grep -rsl "Fabrica Run #$FACTORY_RUN_ID" ~/.pi/agent/sessions/ 2>/dev/null | head -1); [ -n "\$f" ] && tail -n 50 -f "\$f"'
+          Actions log: https://github.com/$FACTORY_REPO/actions/runs/$FACTORY_RUN_ID
+          EOF
+
+      - name: Run the follow-up
+        run: |
+          set -uo pipefail
+          # shellcheck disable=SC1091
+          source ~/factory/models.env
+          # shellcheck disable=SC1091
+          source ~/factory/platform.env 2>/dev/null || true
+          [ -n "${COORDINATOR_MODELS:-}" ] || { echo "::error::COORDINATOR_MODELS not set in ~/factory/models.env"; exit 1; }
+
+          # Ensure a gh-authed checkout exists.
+          REPO_DIR="$HOME/projects/$(basename "$FACTORY_REPO")"
+          if [ ! -d "$REPO_DIR/.git" ]; then
+            mkdir -p "$HOME/projects"
+            gh repo clone "$FACTORY_REPO" "$REPO_DIR"
+          fi
+          cd "$REPO_DIR"
+          # Fork safety: pin gh's default repo to our fork (not the upstream parent).
+          gh repo set-default "$FACTORY_REPO"
+
+          # Check out the PR's HEAD branch (we work on THIS PR, not main).
+          git fetch origin
+          git stash push -u -m "auto: uncommitted changes before follow-up run $FACTORY_RUN_ID ($(date -u +%FT%TZ))" 2>/dev/null || true
+          HEAD_BRANCH="$(gh pr view "$FACTORY_PR" -R "$FACTORY_REPO" --json headRefName --jq .headRefName)"
+          git fetch origin "$HEAD_BRANCH" 2>/dev/null || true
+          git checkout -f "$HEAD_BRANCH" 2>/dev/null || git checkout -f -B "$HEAD_BRANCH" "origin/$HEAD_BRANCH"
+          git reset --hard "origin/$HEAD_BRANCH"
+          git clean -fd
+          # Commits authored as the repo owner (petealbertson); pushes authenticate
+          # as the runner's gh user.
+          git config user.email "5597250+petealbertson@users.noreply.github.com"
+          git config user.name "Peter Albertson"
+
+          # Build the follow-up prompt: coordinator.md + iOS overlay (if iOS) + context.
+          CONTEXT="[Fabrica Run #$FACTORY_RUN_ID | follow-up | $FACTORY_REPO#$FACTORY_PR${FACTORY_ISSUE:+ (issue #$FACTORY_ISSUE)}]
+
+          This is a FOLLOW-UP turn on PR #$FACTORY_PR in $FACTORY_REPO. A human reviewed the PR and left feedback. Your job: address the feedback, then verify with a review round. Push to the PR's head branch ($HEAD_BRANCH). The factory never merges.
+
+          Read the PR first: gh pr view $FACTORY_PR -R $FACTORY_REPO && gh pr diff $FACTORY_PR -R $FACTORY_REPO
+
+          Human feedback (from PR comment):
+          ---
+          $FACTORY_FEEDBACK
+          ---"
+
+          PROMPT="$(cat ~/factory/prompts/coordinator.md)"
+
+          # Append iOS platform overlay if this is an iOS repo.
+          if [ "${PLATFORM:-}" = "ios" ] && [ -f ~/factory/prompts/platforms/ios.md ]; then
+            PROMPT="$PROMPT
+
+          ---
+
+          $(cat ~/factory/prompts/platforms/ios.md)"
+          fi
+
+          PROMPT="$PROMPT
+
+          ---
+
+          $CONTEXT"
+
+          # Retry on transient crashes, rotating the model provider each attempt
+          # (same as the coordinator). Re-running continues the session via
+          # --session-id; the coordinator re-derives state from GitHub and resumes.
+          pick_model() {  # $1 = 1-based index into the space-separated list
+            echo "$COORDINATOR_MODELS" | awk -v n="$1" '{print $n}'
+          }
+          MAX_ATTEMPTS="${FACTORY_MAX_ATTEMPTS:-3}"
+          PRIMARY_MODEL="$(pick_model 1)"
+          attempt=1
+          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+            MODEL="$(pick_model "$attempt")"
+            [ -n "$MODEL" ] || MODEL="$PRIMARY_MODEL"
+            echo "::notice::Follow-up attempt $attempt/$MAX_ATTEMPTS on model: $MODEL"
+            pi --session-id "$FACTORY_SESSION_ID" \
+               --name "fabrica/$FACTORY_REPO#$FACTORY_PR followup-$FACTORY_RUN_ID" \
+               --model "$MODEL" \
+               -p "$PROMPT" && break
+            rc=$?
+            if [ "$attempt" -eq "$MAX_ATTEMPTS" ]; then
+              echo "::error::Follow-up exited $rc after $MAX_ATTEMPTS attempts; giving up."
+              exit "$rc"
+            fi
+            backoff=$(( attempt * 30 ))
+            echo "::warning::Follow-up crashed (exit $rc) on attempt $attempt ($MODEL); retrying in ${backoff}s."
+            git stash push -u -m "auto: pre-retry stash, run $FACTORY_RUN_ID attempt $attempt" 2>/dev/null || true
+            git checkout -f "$HEAD_BRANCH" 2>/dev/null || true
+            git reset --hard "origin/$HEAD_BRANCH"
+            git clean -fd
+            sleep "$backoff"
+            attempt=$(( attempt + 1 ))
+          done
+
+      - name: Notify follow-up complete (@petealbertson)
+        if: success()
+        continue-on-error: true
+        env:
+          FACTORY_REPO: ${{ env.FACTORY_REPO }}
+          FACTORY_PR: ${{ env.FACTORY_PR }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          BODY="@petealbertson ✅ Factory follow-up complete on PR #$FACTORY_PR. Your feedback has been addressed and reviewed. (The factory never merges; the one PR is yours to merge.)"
+          NOTIFY_TOKEN="$(env -u GH_TOKEN gh auth token --user fabrica-agent 2>/dev/null || true)"
+          TOKEN="${NOTIFY_TOKEN:-$GH_TOKEN}"
+          if GH_TOKEN="$TOKEN" gh pr comment "$FACTORY_PR" -R "$FACTORY_REPO" --body "$BODY" 2>/dev/null; then
+            echo "notify: posted as $([ -n "$NOTIFY_TOKEN" ] && echo fabrica-agent || echo github-actions[bot])"
+          else
+            echo "::warning::notify comment failed (fabrica-agent token may lack repo access); the PR is still updated"
+          fi
