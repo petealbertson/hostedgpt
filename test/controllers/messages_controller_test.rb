@@ -188,7 +188,7 @@ class MessagesControllerTest < ActionDispatch::IntegrationTest
     get conversation_messages_url(@conversation, version: 1)
     assert_response :success
 
-    # User messages: flex-row-reverse (right-aligned), blue bubble
+    # User messages: right-aligned (flex-row-reverse), shrink-to-fit blue bubble
     assert_select 'div[data-subrole="user-message"]' do |elements|
       elements.each do |el|
         inner = el.css('[data-role="inner-message"]').first
@@ -196,20 +196,24 @@ class MessagesControllerTest < ActionDispatch::IntegrationTest
           "User message inner row should have flex-row-reverse for right alignment"
 
         contents = el.css('[data-role="message-contents"]').first
+        assert_includes contents['class'], 'w-fit',
+          "User message should shrink-wrap its bubble (w-fit)"
+        assert_includes contents['class'], 'max-w-[80%]',
+          "User message should have max-width constraint"
         assert_includes contents['class'], 'bg-blue-500',
           "User message should have blue bubble background (bg-blue-500)"
         assert_includes contents['class'], 'dark:bg-blue-600',
           "User message should have dark mode blue background"
         assert_includes contents['class'], 'rounded-2xl',
           "User message should have rounded bubble corners"
-        assert_includes contents['class'], 'max-w-[80%]',
-          "User message should have max-width constraint"
+        refute_includes contents['class'], 'flex-1',
+          "User message should NOT stretch (no flex-1)"
         refute_includes contents['class'], 'bg-gray-100',
           "User message should NOT have assistant's gray background"
       end
     end
 
-    # Assistant messages: left-aligned (no flex-row-reverse), gray bubble
+    # Assistant messages: left-aligned (no flex-row-reverse), full-width, no bubble
     assert_select 'div[data-subrole="assistant-message"]' do |elements|
       elements.each do |el|
         inner = el.css('[data-role="inner-message"]').first
@@ -217,25 +221,27 @@ class MessagesControllerTest < ActionDispatch::IntegrationTest
           "Assistant message should NOT have flex-row-reverse (should be left-aligned)"
 
         contents = el.css('[data-role="message-contents"]').first
-        assert_includes contents['class'], 'bg-gray-100',
-          "Assistant message should have gray bubble background (bg-gray-100)"
-        assert_includes contents['class'], 'dark:bg-gray-700',
-          "Assistant message should have dark mode gray background"
-        assert_includes contents['class'], 'rounded-2xl',
-          "Assistant message should have rounded bubble corners"
+        assert_includes contents['class'], 'flex-1',
+          "Assistant message should remain full-width (flex-1)"
+        refute_includes contents['class'], 'bg-gray-100',
+          "Assistant message should NOT have a bubble background"
+        refute_includes contents['class'], 'rounded-2xl',
+          "Assistant message should NOT have bubble corners"
+        refute_includes contents['class'], 'max-w-[80%]',
+          "Assistant message should NOT have bubble max-width"
         refute_includes contents['class'], 'bg-blue-500',
           "Assistant message should NOT have user's blue background"
       end
     end
 
-    # Verify user and assistant bubble backgrounds differ
+    # Verify user has blue bubble and assistant has no bubble
     user_bubble  = css_select('div[data-subrole="user-message"] [data-role="message-contents"]').first
     asst_bubble  = css_select('div[data-subrole="assistant-message"] [data-role="message-contents"]').first
     assert user_bubble, "Expected at least one user message"
     assert asst_bubble, "Expected at least one assistant message"
     assert_includes user_bubble['class'], 'bg-blue-500'
     refute_includes user_bubble['class'], 'bg-gray-100'
-    assert_includes asst_bubble['class'], 'bg-gray-100'
+    refute_includes asst_bubble['class'], 'bg-gray-100'
     refute_includes asst_bubble['class'], 'bg-blue-500'
   end
 
