@@ -32,6 +32,8 @@ module MessagesHelper
       message_to_user = JSON.parse(message.content_text)["message_to_user"]
 
       case function_name
+      when "bravesearch_brave_search"
+        return content_tag(:span, message_to_user, class: "text-gray-400 dark:!text-gray-500 font-normal")
       when "memory_remember_detail_about_user"
         return link_to message_to_user,
         settings_memories_path,
