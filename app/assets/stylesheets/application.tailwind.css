@@ -93,8 +93,9 @@ input:-webkit-autofill:active {
   -webkit-text-fill-color: #000 !important;
 }
 
-input:focus {
-  --tw-ring-color: #ffffff !important;
+input:focus,
+textarea:focus {
+  --tw-ring-color: transparent !important;
 }
 
 /* Animations */
@@ -146,6 +147,10 @@ input:focus {
 
 .prose :where(p):not(:where([class~="not-prose"] *)) {
   @apply mb-3;
+}
+
+.prose :where(p):last-child:not(:where([class~="not-prose"] *)) {
+  @apply mb-0;
 }
 
 @layer base {

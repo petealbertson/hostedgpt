@@ -308,14 +308,16 @@
               w-full pt-[14px] pb-[13px] min-h-14
               mb-2 block
               pl-14 pr-12 relationship:pl-4 show-previews:pt-24
-              bg-transparent
+              bg-white dark:bg-gray-700
               text-black dark:text-gray-200
               placeholder-gray-300 dark:placeholder-gray-500
               text-md
-              rounded-2xl border-gray-300
-              focus:ring-0 focus:border-gray-400 focus:shadow
-              disabled:text-gray-300 disabled:border-gray-200
+              rounded-2xl
+              border border-transparent dark:border-transparent
+              focus:ring-0 focus:border-transparent dark:focus:border-transparent
+              disabled:text-gray-300
               resize-none
+              shadow-lg dark:shadow-md dark:shadow-black/50
             |
           %>
 
@@ -356,7 +358,7 @@
               text-gray-100 dark:text-gray-600
               enabled:text-black
               enabled:dark:text-white
-              bg-white dark:bg-gray-800
+              bg-white dark:bg-gray-700
             | do
           %>
             <%= icon "arrow-up-circle", variant: :solid, size: 39, title: t('app.conversations.ui.send_message'), tooltip: :top %>
