@@ -56,7 +56,7 @@ end %>
       <div
         id="message-contents-<%= message.id %>"
         data-role="message-contents"
-        class="<%= message.user? ? 'text-base rounded-2xl px-4 py-2 bg-blue-500 dark:bg-blue-600 text-white dark:text-white' : 'text-base text-gray-950 dark:text-gray-100' %>"
+        class="<%= message.user? ? 'text-base rounded-2xl px-4 py-2 mr-2 bg-blue-500 dark:bg-blue-600 text-white dark:text-white' : 'text-base text-gray-950 dark:text-gray-100' %>"
       >
 
         <turbo-frame id="message-text-<%= message.id %>">
@@ -151,7 +151,6 @@ end %>
         h-[19px]
         <%= !last_message && done_thinking && 'invisible' %> group-hover:visible
         <%= 'justify-end' if message.user? %>
-        <%= 'mt-2' if message.user? %>
       ">
         <% if message.versions.length > 1 %>
           <%= button_to message_path(message, version: previous_version),
