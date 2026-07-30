@@ -80,16 +80,24 @@ jobs:
 
           echo "ok=$OK"           >> "$GITHUB_OUTPUT"
           echo "pr=$PR"           >> "$GITHUB_OUTPUT"
-          echo "feedback=$FEEDBACK" >> "$GITHUB_OUTPUT"
           echo "session_id=$SESSION_ID" >> "$GITHUB_OUTPUT"
           echo "issue=$ISSUE"     >> "$GITHUB_OUTPUT"
+          # GitHub Actions step outputs must be single-line. The feedback can
+          # be multi-line (e.g. pasted error traces), so use the multi-line
+          # delimiter syntax to avoid 'Invalid format' errors. See:
+          # https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#multiline-strings
+          {
+            echo "feedback<<EOF"
+            echo "$FEEDBACK"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
           echo "::notice::$COMMENTER permission=$PERM → follow-up on PR #$PR (session=$SESSION_ID, authorized=$OK)"
 
   followup:
     needs: authorize
     if: ${{ needs.authorize.outputs.ok == 'true' && needs.authorize.outputs.feedback != '' }}
     runs-on: [self-hosted, factory, '${{ github.repository }}']
-    timeout-minutes: 720
+    timeout-minutes: 360
     env:
       FACTORY_REPO: ${{ github.repository }}
       FACTORY_PR: ${{ needs.authorize.outputs.pr }}
@@ -156,6 +164,17 @@ jobs:
           # as the runner's gh user.
           git config user.email "5597250+petealbertson@users.noreply.github.com"
           git config user.name "Peter Albertson"
+
+          # Install the pre-push threat scanner (hard gate against prompt-injection
+          # exfiltration: secret leaks, suspicious commands, and pushes to main).
+          # The hook survives `git reset`/`git clean` (it lives in .git/hooks/),
+          # so it's reinstalled idempotently each run. See factory-threat-scan.
+          mkdir -p "$REPO_DIR/.git/hooks"
+          cat > "$REPO_DIR/.git/hooks/pre-push" <<'HOOK'
+          #!/usr/bin/env bash
+          exec ~/factory/templates/scripts/factory-threat-scan --pre-push
+          HOOK
+          chmod +x "$REPO_DIR/.git/hooks/pre-push"
 
           # Build the follow-up prompt: coordinator.md + iOS overlay (if iOS) + context.
           CONTEXT="[Fabrica Run #$FACTORY_RUN_ID | follow-up | $FACTORY_REPO#$FACTORY_PR${FACTORY_ISSUE:+ (issue #$FACTORY_ISSUE)}]
