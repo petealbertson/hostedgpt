@@ -183,6 +183,8 @@ jobs:
 
           Read the PR first: gh pr view $FACTORY_PR -R $FACTORY_REPO && gh pr diff $FACTORY_PR -R $FACTORY_REPO
 
+          When done: restart the dev server so the human can smoke-test immediately (devloop server stop/start on Rails). The server MUST run the latest code — see Step 3 of your prompt.
+
           Human feedback (from PR comment):
           ---
           $FACTORY_FEEDBACK
